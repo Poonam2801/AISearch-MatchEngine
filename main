@@ -1,0 +1,787 @@
+#to run this code - python3 -m streamlit run app.py
+
+import streamlit as st
+import json
+import logging
+import urllib3
+import time
+import os
+import re
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from anthropic import Anthropic
+from typing import List, Dict, Tuple, Optional
+import plotly.express as px
+import plotly.graph_objects as go
+import threading
+
+# Configure Streamlit page
+st.set_page_config(
+    page_title="AI Resume Matcher",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+.main-header {
+    font-size: 3rem;
+    color: #1f77b4;
+    text-align: center;
+    margin-bottom: 2rem;
+}
+.metric-card {
+    background-color: #f0f2f6;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    margin: 0.5rem 0;
+}
+.success-box {
+    background-color: #d4edda;
+    border: 1px solid #c3e6cb;
+    color: #155724;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    margin: 1rem 0;
+}
+.warning-box {
+    background-color: #fff3cd;
+    border: 1px solid #ffeaa7;
+    color: #856404;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    margin: 1rem 0;
+}
+.filter-section {
+    background-color: #f8f9fa;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    margin: 1rem 0;
+    border-left: 4px solid #007bff;
+}
+.auto-populated {
+    background-color: #e8f5e8;
+    border: 1px solid #4caf50;
+    border-radius: 0.25rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+    color: #2e7d32;
+    margin-bottom: 0.5rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Set up logging
+@st.cache_resource
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    return logger
+
+logger = setup_logging()
+
+# Configuration
+http = urllib3.PoolManager(
+    maxsize=20,
+    block=False,
+    timeout=urllib3.Timeout(connect=5.0, read=10.0)
+)
+
+# Pricing constants for Claude
+CLAUDE_COST_PER_INPUT_TOKEN = 0.000003
+CLAUDE_COST_PER_OUTPUT_TOKEN = 0.000015
+
+# Load API Keys from environment variables
+AIRTABLE_API_KEY = os.getenv('AIRTABLE_API_KEY')
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+AIRTABLE_BASE_ID = os.getenv('AIRTABLE_BASE_ID')
+CANDIDATES_TABLE_ID = os.getenv('CANDIDATES_TABLE_ID', 'tbldrNIKXchrExJwn')
+CANDIDATES_VIEW_ID = os.getenv('CANDIDATES_VIEW_ID', 'viwbiLAQY8fwHBRxm')
+JOBS_TABLE_ID = os.getenv('JOBS_TABLE_ID', 'tblpXdqzHKlXbf8CL')
+JOBS_VIEW_ID = os.getenv('JOBS_VIEW_ID', 'viw1b6oaGb7KmuzTM')
+
+# Check if API keys are set
+if not AIRTABLE_API_KEY or not ANTHROPIC_API_KEY or not AIRTABLE_BASE_ID:
+    st.error("⚠️ Missing required environment variables. Please set AIRTABLE_API_KEY, ANTHROPIC_API_KEY, and AIRTABLE_BASE_ID")
+    st.info("Create a .env file or set environment variables with your API credentials")
+    st.stop()
+
+BASE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
+
+def parse_keywords_from_text(keywords_text: str) -> List[str]:
+    """Parse keywords from text input (comma or newline separated)"""
+    if not keywords_text.strip():
+        return []
+    
+    keywords = []
+    # Split by lines first, then by commas
+    lines = keywords_text.strip().split('\n')
+    for line in lines:
+        if ',' in line:
+            keywords.extend([kw.strip() for kw in line.split(',') if kw.strip()])
+        else:
+            if line.strip():
+                keywords.append(line.strip())
+    
+    # Remove duplicates and empty strings
+    keywords = list(set([kw for kw in keywords if kw]))
+    return keywords
+
+
+def get_job_auto_values(selected_job: Dict) -> Dict:
+    """Extract auto-populate values from selected job"""
+    job_fields = selected_job.get('fields', {})
+    
+    # Get role values (convert to list format)
+    job_role = job_fields.get('Select the role', '')
+    if isinstance(job_role, str) and job_role:
+        job_roles = [job_role]
+    elif isinstance(job_role, list):
+        job_roles = job_role
+    else:
+        job_roles = []
+    
+    # Get function values (convert to list format)
+    job_function = job_fields.get('function', '')
+    if isinstance(job_function, str) and job_function:
+        job_functions = [job_function]
+    elif isinstance(job_function, list):
+        job_functions = job_function
+    else:
+        job_functions = []
+    
+    # Get industry values (convert to list format)
+    job_industry = job_fields.get('industry', '')
+    if isinstance(job_industry, str) and job_industry:
+        job_industries = [job_industry]
+    elif isinstance(job_industry, list):
+        job_industries = job_industry
+    else:
+        job_industries = []
+    
+    # Get keywords and AI prompt
+    job_keywords = job_fields.get('Targeted Resume Keywords', '')
+    job_ai_prompt = job_fields.get('One-liner job description', '')
+    
+    return {
+        'roles': job_roles,
+        'functions': job_functions,
+        'industries': job_industries,
+        'keywords': job_keywords,
+        'ai_prompt': job_ai_prompt
+    }
+
+
+class StreamlitAgenticWorkflow:
+    def __init__(self):
+        self.anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.token_counter = {
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'total_cost': 0,
+            'processed_count': 0,
+            'lock': threading.Lock()
+        }
+    
+    def get_airtable_headers(self):
+        return {
+            'Authorization': f'Bearer {AIRTABLE_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+    
+    def verify_airtable_setup(self):
+        """Verify Airtable connection and show available views"""
+        try:
+            url = f"{BASE_URL}/{CANDIDATES_TABLE_ID}"
+            response = http.request(
+                'GET', url,
+                headers=self.get_airtable_headers()
+            )
+            
+            if response.status == 200:
+                st.success("✅ Airtable connection successful")
+                return True
+            else:
+                st.error(f"❌ Airtable connection failed: {response.status}")
+                return False
+                
+        except Exception as e:
+            st.error(f"❌ Connection error: {str(e)}")
+            return False
+    
+    def fetch_sample_candidates(self, limit=100):
+        """Fetch a limited number of candidates for testing purposes"""
+        url = f"{BASE_URL}/{CANDIDATES_TABLE_ID}/listRecords"
+        
+        query = {
+            "fields": ["skill", "work_experience", "Resume_url", "email", 
+                      "Current CTC numeric", "Notice Period", "education", 
+                      "Function(demo)", "total_experience_in_years", "Select your role",
+                      "industry"],
+            "view": CANDIDATES_VIEW_ID,
+            "pageSize": min(limit, 100)
+        }
+        
+        try:
+            with st.spinner(f"Loading first {limit} candidates for testing..."):
+                response = http.request(
+                    'POST', url,
+                    body=json.dumps(query).encode('utf-8'),
+                    headers=self.get_airtable_headers(),
+                    timeout=30
+                )
+                
+                if response.status != 200:
+                    st.error(f"❌ API Error {response.status}")
+                    return []
+                
+                response_data = json.loads(response.data.decode('utf-8'))
+                if 'error' in response_data:
+                    st.error(f"Airtable API Error: {response_data['error']}")
+                    return []
+                
+                records = response_data.get('records', [])
+                st.success(f"✅ Loaded {len(records)} sample candidates for testing")
+                
+                return records
+                
+        except Exception as e:
+            st.error(f"Error fetching sample candidates: {str(e)}")
+            return []
+    
+    def fetch_batch_parallel(self, offset=None):
+        """Fetch a single batch from Airtable - for parallel execution"""
+        url = f"{BASE_URL}/{CANDIDATES_TABLE_ID}/listRecords"
+        
+        query = {
+            "fields": ["skill", "work_experience", "Resume_url", "email", 
+                      "Current CTC numeric", "Notice Period", "education", 
+                      "Function(demo)", "total_experience_in_years", "Select your role",
+                      "industry"],
+            "view": CANDIDATES_VIEW_ID,
+            "pageSize": 100
+        }
+        
+        if offset:
+            query["offset"] = offset
+        
+        try:
+            response = http.request(
+                'POST', url,
+                body=json.dumps(query).encode('utf-8'),
+                headers=self.get_airtable_headers(),
+                timeout=15,
+                retries=False
+            )
+            
+            if response.status != 200:
+                return {'records': [], 'offset': None, 'error': f"Status {response.status}"}
+            
+            response_data = json.loads(response.data.decode('utf-8'))
+            
+            if 'error' in response_data:
+                return {'records': [], 'offset': None, 'error': response_data['error']}
+            
+            return {
+                'records': response_data.get('records', []),
+                'offset': response_data.get('offset'),
+                'error': None
+            }
+            
+        except Exception as e:
+            return {'records': [], 'offset': None, 'error': str(e)}
+    
+    def fetch_all_candidates_parallel(self):
+        """SUPER OPTIMIZED: Fetch all candidates using parallel requests"""
+        
+        # Check cache first
+        if 'candidates_cache' in st.session_state and st.session_state.candidates_cache:
+            st.success(f"⚡ Loaded {len(st.session_state.candidates_cache)} candidates from cache instantly!")
+            return st.session_state.candidates_cache
+        
+        all_candidates = []
+        
+        progress_container = st.container()
+        
+        with progress_container:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            status_text.text("🚀 Starting SUPER FAST parallel fetch...")
+        
+        try:
+            # Step 1: Fetch first batch to get offset
+            status_text.text("📊 Fetching initial batch...")
+            first_batch = self.fetch_batch_parallel()
+            
+            if first_batch['error']:
+                st.error(f"Error: {first_batch['error']}")
+                return []
+            
+            all_candidates.extend(first_batch['records'])
+            
+            # If no more data, return
+            if not first_batch['offset']:
+                st.session_state.candidates_cache = all_candidates
+                progress_bar.progress(1.0)
+                status_text.text(f"✅ Loaded {len(all_candidates)} candidates")
+                return all_candidates
+            
+            # Step 2: Estimate total batches
+            estimated_total = len(all_candidates) * 100
+            
+            # Step 3: Fetch remaining batches in PARALLEL
+            status_text.text("⚡ PARALLEL FETCH MODE ACTIVATED...")
+            
+            offsets_to_fetch = [first_batch['offset']]
+            batch_count = 1
+            max_workers = 5
+            
+            while offsets_to_fetch:
+                current_offsets = offsets_to_fetch[:max_workers]
+                offsets_to_fetch = offsets_to_fetch[max_workers:]
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(self.fetch_batch_parallel, offset): offset 
+                              for offset in current_offsets}
+                    
+                    for future in as_completed(futures):
+                        result = future.result()
+                        
+                        if result['error']:
+                            st.warning(f"Batch error: {result['error']}")
+                            continue
+                        
+                        all_candidates.extend(result['records'])
+                        batch_count += 1
+                        
+                        if result['offset']:
+                            offsets_to_fetch.append(result['offset'])
+                        
+                        progress = min(0.95, len(all_candidates) / max(estimated_total, len(all_candidates) + 100))
+                        progress_bar.progress(progress)
+                        status_text.text(f"⚡ FAST MODE: {len(all_candidates)} candidates | {batch_count} batches")
+            
+            st.session_state.candidates_cache = all_candidates
+            
+            progress_bar.progress(1.0)
+            status_text.text(f"✅ SUPER FAST LOAD: {len(all_candidates)} candidates in {batch_count} batches!")
+            
+            if len(all_candidates) > 0:
+                with st.container():
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("📊 Total Candidates", len(all_candidates))
+                    with col2:
+                        st.metric("⚡ Batches (Parallel)", batch_count)
+                    with col3:
+                        candidates_with_experience = len([c for c in all_candidates if c.get('fields', {}).get('total_experience_in_years')])
+                        st.metric("✅ With Experience", candidates_with_experience)
+            
+            return all_candidates
+            
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
+            return []
+    
+    @st.cache_data(ttl=7200, show_spinner=False)
+    def fetch_all_candidates(_self):
+        """Wrapper for cached parallel fetch"""
+        return _self.fetch_all_candidates_parallel()
+    
+    def fetch_jobs(self, table_id=None, view_id=None):
+        """Fetch all jobs from a specific Airtable view with proper pagination"""
+        if table_id is None:
+            table_id = JOBS_TABLE_ID
+        if view_id is None:
+            view_id = JOBS_VIEW_ID
+            
+        url = f"{BASE_URL}/{table_id}/listRecords"
+        all_jobs = []
+        offset = None
+        page_count = 0
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        st.info(f"🔍 Fetching jobs from view: {view_id}")
+        
+        with st.spinner("Loading all jobs from the specified view..."):
+            while True:
+                try:
+                    query = {
+                        "view": view_id,
+                        "pageSize": 100,
+                        "fields": [
+                            "Role Description", 
+                            "function", 
+                            "CTC Budget Numeric", 
+                            "Experience needed in years", 
+                            "Select the role", 
+                            "Position & Client Name",
+                            "industry",
+                            "Targeted Resume Keywords",
+                            "One-liner job description"
+                        ]
+                    }
+                    
+                    if offset:
+                        query["offset"] = offset
+                    
+                    response = http.request(
+                        'POST', 
+                        url,
+                        body=json.dumps(query).encode('utf-8'),
+                        headers=self.get_airtable_headers(),
+                        timeout=15,
+                        retries=urllib3.Retry(2, backoff_factor=0.2)
+                    )
+                    
+                    if response.status == 429:
+                        st.warning("⚠️ Rate limit reached. Waiting 10 seconds...")
+                        time.sleep(10)
+                        continue
+                    
+                    if response.status != 200:
+                        error_data = response.data.decode('utf-8')
+                        st.error(f"❌ Airtable API Error {response.status}: {error_data}")
+                        break
+                    
+                    response_data = json.loads(response.data.decode('utf-8'))
+                    
+                    if 'error' in response_data:
+                        st.error(f"❌ API Error: {response_data['error']}")
+                        break
+                    
+                    records = response_data.get('records', [])
+                    all_jobs.extend(records)
+                    page_count += 1
+                    
+                    progress = min(0.9, page_count * 0.1)
+                    progress_bar.progress(progress)
+                    status_text.text(f"📊 Fetched {len(all_jobs)} jobs from {page_count} pages...")
+                    
+                    offset = response_data.get('offset')
+                    if not offset:
+                        break
+                    
+                except urllib3.exceptions.TimeoutError:
+                    st.warning("⚠️ Request timeout. Retrying...")
+                    time.sleep(1)
+                    continue
+                    
+                except json.JSONDecodeError as e:
+                    st.error(f"❌ JSON decode error: {str(e)}")
+                    break
+                    
+                except Exception as e:
+                    st.error(f"❌ Error fetching jobs: {str(e)}")
+                    break
+        
+        progress_bar.progress(1.0)
+        
+        if all_jobs:
+            status_text.text(f"✅ Successfully fetched {len(all_jobs)} jobs from view {view_id}")
+            st.success(f"🎉 Found {len(all_jobs)} jobs in the specified view!")
+        else:
+            status_text.text(f"❌ No jobs found in view {view_id}")
+        
+        return all_jobs
+    
+    def get_unique_roles_functions_industries(self, candidates: List[Dict]) -> Dict:
+        """Extract unique roles, functions, and industries from candidates only"""
+        candidate_roles = set()
+        candidate_functions = set()
+        candidate_industries = set()
+        
+        for candidate in candidates:
+            fields = candidate.get('fields', {})
+            
+            roles = fields.get('Select your role', [])
+            if isinstance(roles, str):
+                candidate_roles.add(roles)
+            elif isinstance(roles, list):
+                candidate_roles.update(roles)
+            
+            functions = fields.get('Function(demo)', [])
+            if isinstance(functions, str):
+                candidate_functions.add(functions)
+            elif isinstance(functions, list):
+                candidate_functions.update(functions)
+            
+            industries = fields.get('industry', [])
+            if isinstance(industries, str):
+                candidate_industries.add(industries)
+            elif isinstance(industries, list):
+                candidate_industries.update(industries)
+        
+        return {
+            'candidate_roles': sorted(list(candidate_roles)),
+            'candidate_functions': sorted(list(candidate_functions)),
+            'candidate_industries': sorted(list(candidate_industries))
+        }
+    
+    def search_keywords_in_resume(self, candidate: Dict, keywords: List[str]) -> Dict:
+        """Search for keywords in candidate's resume text and return match details"""
+        fields = candidate.get('fields', {})
+        
+        searchable_text = " ".join([
+            fields.get('work_experience', ''),
+            fields.get('skill', ''),
+            fields.get('education', '')
+        ]).lower()
+        
+        matched_keywords = []
+        keyword_counts = {}
+        
+        for keyword in keywords:
+            keyword_lower = keyword.lower().strip()
+            if keyword_lower and keyword_lower in searchable_text:
+                matched_keywords.append(keyword)
+                keyword_counts[keyword] = searchable_text.count(keyword_lower)
+        
+        match_percentage = (len(matched_keywords) / len(keywords) * 100) if keywords else 0
+        
+        return {
+            'matched_keywords': matched_keywords,
+            'keyword_counts': keyword_counts,
+            'match_percentage': round(match_percentage, 1),
+            'total_matches': sum(keyword_counts.values())
+        }
+    
+    def filter_candidates_flexible(self, all_candidates: List[Dict], filter_config: Dict) -> List[Dict]:
+        """Flexible candidate filtering with logical order"""
+        progress_container = st.container()
+        
+        with progress_container:
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            
+            with col1:
+                st.metric("Total Candidates", len(all_candidates))
+            
+            # Step 1: Quality filter
+            quality_filtered = []
+            if filter_config.get('enable_quality_filter', True):
+                for candidate in all_candidates:
+                    fields = candidate.get('fields', {})
+                    skill = fields.get('skill', '').strip()
+                    work_exp = fields.get('work_experience', '').strip()
+                    
+                    if (skill and work_exp and 
+                        len(skill) >= filter_config.get('min_skill_length', 50) and 
+                        len(work_exp) >= filter_config.get('min_experience_length', 100) and
+                        len(skill.split()) >= 10 and len(work_exp.split()) >= 20):
+                        quality_filtered.append(candidate)
+            else:
+                quality_filtered = all_candidates
+            
+            with col2:
+                st.metric("After Quality", len(quality_filtered))
+            
+            # Step 2: Apply matching filters
+            multi_filtered = []
+            
+            for candidate in quality_filtered:
+                fields = candidate.get('fields', {})
+                passes_all_filters = True
+                
+                if filter_config.get('enable_role_filter', False) and filter_config.get('selected_roles', []):
+                    candidate_roles = fields.get('Select your role', [])
+                    if isinstance(candidate_roles, str):
+                        candidate_roles = [candidate_roles]
+                    elif not isinstance(candidate_roles, list):
+                        candidate_roles = []
+                    
+                    role_match = any(job_role.lower() in [role.lower() for role in candidate_roles] 
+                                   for job_role in filter_config['selected_roles'])
+                    
+                    if not role_match:
+                        passes_all_filters = False
+                
+                if filter_config.get('enable_function_filter', False) and filter_config.get('selected_functions', []):
+                    candidate_functions = fields.get('Function(demo)', [])
+                    if isinstance(candidate_functions, str):
+                        candidate_functions = [candidate_functions]
+                    elif not isinstance(candidate_functions, list):
+                        candidate_functions = []
+                    
+                    function_match = any(job_func.lower() in [func.lower() for func in candidate_functions] 
+                                       for job_func in filter_config['selected_functions'])
+                    
+                    if not function_match:
+                        passes_all_filters = False
+                
+                if filter_config.get('enable_industry_filter', False) and filter_config.get('selected_industries', []):
+                    candidate_industries = fields.get('industry', [])
+                    if isinstance(candidate_industries, str):
+                        candidate_industries = [candidate_industries]
+                    elif not isinstance(candidate_industries, list):
+                        candidate_industries = []
+                    
+                    industry_match = any(job_industry.lower() in [industry.lower() for industry in candidate_industries] 
+                                       for job_industry in filter_config['selected_industries'])
+                    
+                    if not industry_match:
+                        passes_all_filters = False
+                
+                if passes_all_filters:
+                    multi_filtered.append(candidate)
+            
+            with col3:
+                st.metric("After Match Filters", len(multi_filtered))
+            
+            # Step 3: Experience filter
+            experience_filtered = []
+            for c in multi_filtered:
+                cand_exp = c['fields'].get('total_experience_in_years')
+                if cand_exp is not None and filter_config['exp_min'] <= cand_exp <= filter_config['exp_max']:
+                    experience_filtered.append(c)
+            
+            with col4:
+                st.metric("After Experience", len(experience_filtered))
+            
+            # Step 4: CTC filter
+            ctc_filtered = []
+            for c in experience_filtered:
+                cand_ctc = c['fields'].get('Current CTC numeric')
+                if cand_ctc is not None and filter_config['ctc_min'] <= cand_ctc <= filter_config['ctc_max']:
+                    ctc_filtered.append(c)
+            
+            with col5:
+                st.metric("After CTC", len(ctc_filtered))
+            
+            # Step 5: Keyword filter
+            keyword_filtered = ctc_filtered
+            if filter_config.get('enable_keyword_search', False) and filter_config.get('keywords', []):
+                keyword_filtered = []
+                keywords = filter_config['keywords']
+                min_keyword_matches = filter_config.get('min_keyword_matches', 1)
+                
+                for c in ctc_filtered:
+                    keyword_result = self.search_keywords_in_resume(c, keywords)
+                    if len(keyword_result['matched_keywords']) >= min_keyword_matches:
+                        c['keyword_match_data'] = keyword_result
+                        keyword_filtered.append(c)
+            
+            with col6:
+                st.metric("Final Count", len(keyword_filtered))
+        
+        return keyword_filtered
+    
+    def enhance_job_description(self, abstract_jd: str, role: str, experience_years: int, ctc_budget: float) -> Dict:
+        """Transform abstract JD into comprehensive role description"""
+        prompt = f"""
+You are a Job Description Enhancement Agent. Transform this abstract job description into a comprehensive, detailed role description.
+
+Input Details:
+- Role: {role}
+- Experience Required: {experience_years} years
+- CTC Budget: {ctc_budget} LPA
+- Abstract JD: {abstract_jd}
+
+Create a comprehensive role description with:
+1. Clear role title and summary
+2. Detailed responsibilities (5-8 bullet points)
+3. Required technical skills (specific technologies, tools, methodologies)
+4. Required soft skills and competencies
+5. Educational qualifications
+6. Industry experience preferences
+7. Key performance indicators or success metrics
+
+Return ONLY a JSON object with this structure:
+{{
+  "role_title": "Enhanced role title",
+  "role_summary": "2-3 sentence summary of the role",
+  "key_responsibilities": ["responsibility 1", "responsibility 2", ...],
+  "technical_skills": ["skill 1", "skill 2", ...],
+  "soft_skills": ["skill 1", "skill 2", ...],
+  "education_requirements": "Education details",
+  "industry_experience": "Preferred industry background",
+  "success_metrics": ["metric 1", "metric 2", ...],
+  "enhanced_description": "Complete detailed role description text"
+}}
+"""
+        
+        try:
+            message = self.anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            response_text = message.content[0].text
+            
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                enhanced_jd = json.loads(json_match.group())
+            else:
+                enhanced_jd = json.loads(response_text)
+            
+            self._update_token_counter(message.usage)
+            return enhanced_jd
+            
+        except Exception as e:
+            st.error(f"Error enhancing JD: {str(e)}")
+            return {"enhanced_description": abstract_jd, "technical_skills": [], "key_responsibilities": []}
+    
+    def get_ai_score(self, candidate: Dict, enhanced_jd: Dict, custom_prompt: str = None) -> int:
+        """Get AI score for candidate fit based on work experience"""
+        try:
+            fields = candidate.get('fields', {})
+            
+            if custom_prompt:
+                prompt = f"""
+{custom_prompt}
+
+CANDIDATE PROFILE DATA:
+Work Experience: {fields.get('work_experience', '')}
+Skills: {fields.get('skill', '')}
+Education: {fields.get('education', '')}
+Total Experience: {fields.get('total_experience_in_years', 0)} years
+Current CTC: {fields.get('Current CTC numeric', 0)} LPA
+
+ROLE REQUIREMENTS FOR REFERENCE:
+{enhanced_jd.get('enhanced_description', '')}
+
+Key Responsibilities Needed: {enhanced_jd.get('key_responsibilities', [])}
+Technical Skills Needed: {enhanced_jd.get('technical_skills', [])}
+
+IMPORTANT: You must respond with ONLY a number between 0-100. Do not include any text, explanations, or additional content. Just the score number.
+"""
+            else:
+                prompt = f"""
+Rate this candidate's fit for the role based on their work experience (0-100):
+
+ROLE REQUIREMENTS:
+{enhanced_jd.get('enhanced_description', '')}
+
+Key Responsibilities Needed:
+{enhanced_jd.get('key_responsibilities', [])}
+
+Technical Skills Needed:
+{enhanced_jd.get('technical_skills', [])}
+
+CANDIDATE PROFILE:
+Work Experience: {fields.get('work_experience', '')}
+Skills: {fields.get('skill', '')}
+Education: {fields.get('education', '')}
+
+Focus primarily on how well their WORK EXPERIENCE aligns with the job requirements.
+Consider:
+1. Relevant job titles and responsibilities
+2. Technology/tool experience mentioned
+3. Industry experience
+4. Project complexity and scope
+5. Years of relevant experience
+
+IMPORTANT: Respond with ONLY a number between 0-100. No text, no explanations, just the numerical score.
+"""
+            
+            message = self.anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=50,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            response_text = message.content
