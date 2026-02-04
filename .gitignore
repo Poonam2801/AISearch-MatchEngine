@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Test/Build
+.pytest_cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
